@@ -1,0 +1,21 @@
+services:
+  rollout-vote:
+    build: .
+    image: rollout-vote:latest
+    container_name: rollout-vote
+    restart: unless-stopped
+    user: "1000:10"
+    ports:
+      - "8080:8080"
+    environment:
+      TZ: "Asia/Seoul"          # /stats 의 시각 표기용
+      VOTE_PORT: "8080"
+      VOTE_HOST: "0.0.0.0"
+      VOTE_CLIPS: "/clips"
+      VOTE_POOL: "/data/vote_pool.json"
+      VOTE_DB: "/data/vote.db"
+    volumes:
+      # 영상은 이미지에 굽지 않는다 — 읽기 전용 bind mount
+      - /volume1/docker/rollout_vote/clips:/clips:ro
+      # sqlite DB + vote_pool.json (쓰기 가능해야 함)
+      - /volume1/docker/rollout_vote/data:/data

@@ -1,0 +1,13 @@
+# 빌드 컨텍스트에서 제외 — 앱은 app.py / index.html 만 필요하다
+data/
+clips/
+*.db
+*.db-wal
+*.db-shm
+*.mp4
+*.json
+__pycache__/
+*.pyc
+.DS_Store
+README.md
+docker-compose.yml

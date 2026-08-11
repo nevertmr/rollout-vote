@@ -1,0 +1,9 @@
+data/
+*.db
+*.db-wal
+*.db-shm
+clips/
+vote_pool.json
+__pycache__/
+*.pyc
+*.mp4
