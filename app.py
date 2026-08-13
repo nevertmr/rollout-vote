@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-rollout_vote — 롤아웃 클립 쌍비교(선호투표) 웹앱.
+rollout_vote — 롤아웃 클립 쌍비교(선호투표) 웹앱. HTTP 핸들러 + 엔트리.
 
 표준 라이브러리만 사용한다(외부 의존성 0).
 같은 스텝의 서로 다른 두 시도 영상을 보여주고 더 나은 쪽을 고르게 한다.
 수집된 쌍비교는 Bradley-Terry 잠재점수 추정에 쓰인다.
+
+모듈 구성
+  vote_config.py   상수·환경변수·공용 유틸
+  vote_db.py       sqlite 스키마·마이그레이션·시딩·쿼리
+  vote_serving.py  쌍 선택(ACTIVE_STEPS 필터·second-opinion·클립 존재 확인)
+  app.py           HTTP 핸들러 + 엔트리 (이 파일)
 
 환경변수
   VOTE_PORT   listen 포트 (기본 8080)
@@ -17,410 +23,38 @@ rollout_vote — 롤아웃 클립 쌍비교(선호투표) 웹앱.
 실행:  python3 app.py
 """
 
-import datetime
 import http.cookies
 import json
 import mimetypes
 import os
 import re
-import sqlite3
 import sys
-import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from itertools import combinations
 from urllib.parse import parse_qs, urlparse
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-
-
-def _default(*rel):
-    return os.path.abspath(os.path.join(ROOT, *rel))
-
-
-PORT = int(os.environ.get("VOTE_PORT", "8080"))
-HOST = os.environ.get("VOTE_HOST", "0.0.0.0")
-CLIPS_DIR = os.path.abspath(os.environ.get(
-    "VOTE_CLIPS", _default("..", "..", "intern_coffee", "vote_clips")))
-POOL_PATH = os.path.abspath(os.environ.get(
-    "VOTE_POOL", _default("..", "..", "intern_coffee", "vote_pool.json")))
-DB_PATH = os.path.abspath(os.environ.get("VOTE_DB", _default("data", "vote.db")))
-INDEX_PATH = _default("index.html")
-
-CHUNK = 256 * 1024
-CLIP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,120}\.mp4$")
-COOKIE_NAME = "voter"
-COOKIE_MAX_AGE = 31536000  # 1년
-CAND_LIMIT = 60            # 클립 존재 확인용 후보 개수
-HISTORY_MAX = 200          # /api/history limit 상한
-
-# 집중 수집 대상 스텝. 빈 문자열이면 전체 스텝 서빙(기존 동작).
-ACTIVE_STEPS = [int(s) for s in
-                os.environ.get("VOTE_ACTIVE_STEPS", "3,10").split(",")
-                if s.strip().isdigit()]
-# 이 확률로 "이미 1표 받은 쌍"을 우선 배정 — 같은 쌍에 서로 다른 투표자의
-# 표를 겹치게 만들어 사람 간 일치율(inter-rater)을 잴 수 있게 한다.
-SECOND_OPINION_P = float(os.environ.get("VOTE_SECOND_OPINION_P", "0.25"))
-
-KST = datetime.timezone(datetime.timedelta(hours=9))
-
-# 브라우저가 연결을 끊는 것은 오류가 아니다(영상 로딩 중단·탭 닫힘 등)
-CONN_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
-
-
-def log(msg):
-    sys.stderr.write("[vote] %s\n" % msg)
-    sys.stderr.flush()
-
-
-def kst_iso(ts=None):
-    """KST(+09:00) ISO8601 문자열. 예: 2026-08-11T18:04:12+09:00"""
-    if ts is None:
-        ts = time.time()
-    return datetime.datetime.fromtimestamp(ts, KST).isoformat(timespec="seconds")
-
-
-# --------------------------------------------------------------------------
-# DB
-# --------------------------------------------------------------------------
-_local = threading.local()
-_write_lock = threading.Lock()
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS items(
-  eid         TEXT PRIMARY KEY,
-  step        INTEGER,
-  run         TEXT,
-  ep          INTEGER,
-  outcome     TEXT,
-  clip        TEXT,
-  n_frames    INTEGER,
-  instruction TEXT
-);
-CREATE TABLE IF NOT EXISTS pairs(
-  id    INTEGER PRIMARY KEY,
-  step  INTEGER,
-  a     TEXT,
-  b     TEXT,
-  votes INTEGER DEFAULT 0,
-  UNIQUE(a, b)
-);
-CREATE TABLE IF NOT EXISTS votes(
-  id             INTEGER PRIMARY KEY,
-  pair_id        INTEGER,
-  winner         TEXT,
-  loser          TEXT,
-  tie            INTEGER DEFAULT 0,
-  voter          TEXT,
-  ts             REAL,
-  dwell_ms       INTEGER,
-  created_at_iso TEXT,
-  active         INTEGER DEFAULT 1,
-  superseded_by  INTEGER,
-  revised_from   INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_pairs_votes   ON pairs(votes);
-CREATE INDEX IF NOT EXISTS idx_pairs_step    ON pairs(step);
-CREATE INDEX IF NOT EXISTS idx_votes_voter   ON votes(voter);
-CREATE INDEX IF NOT EXISTS idx_votes_pair    ON votes(pair_id);
-"""
-
-# 정정 이력을 남기려면 (voter,pair_id) 당 여러 행이 존재해야 한다.
-# 배포본에 있던 전면 UNIQUE 는 버리고, "active 표는 쌍당 하나" 만 강제한다.
-NEW_COLUMNS = (
-    ("created_at_iso", "TEXT"),
-    ("active", "INTEGER DEFAULT 1"),
-    ("superseded_by", "INTEGER"),
-    ("revised_from", "INTEGER"),
+from vote_config import (
+    CHUNK,
+    CLIP_RE,
+    CLIPS_DIR,
+    CONN_ERRORS,
+    COOKIE_MAX_AGE,
+    COOKIE_NAME,
+    DB_PATH,
+    HISTORY_MAX,
+    HOST,
+    INDEX_PATH,
+    PORT,
+    STATIC_DIR,
+    STATIC_RE,
+    kst_iso,
+    log,
 )
-
-# votes 테이블의 정본 컬럼 (이름, 선언) — 테이블 재작성 시 이 정의를 쓴다.
-VOTE_COLUMNS = (
-    ("id", "INTEGER PRIMARY KEY"),
-    ("pair_id", "INTEGER"),
-    ("winner", "TEXT"),
-    ("loser", "TEXT"),
-    ("tie", "INTEGER DEFAULT 0"),
-    ("voter", "TEXT"),
-    ("ts", "REAL"),
-    ("dwell_ms", "INTEGER"),
-    ("created_at_iso", "TEXT"),
-    ("active", "INTEGER DEFAULT 1"),
-    ("superseded_by", "INTEGER"),
-    ("revised_from", "INTEGER"),
-)
-VOTE_COLNAMES = tuple(n for n, _ in VOTE_COLUMNS)
-
-# 테이블이 다시 만들어지면 인덱스도 같이 사라진다 → 아래를 항상 다시 보장한다.
-VOTE_INDEXES = (
-    "CREATE INDEX IF NOT EXISTS idx_votes_voter ON votes(voter)",
-    "CREATE INDEX IF NOT EXISTS idx_votes_pair ON votes(pair_id)",
-    "CREATE INDEX IF NOT EXISTS idx_votes_active ON votes(active)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_votes_active_pair"
-    " ON votes(voter, pair_id) WHERE active=1",
-)
+from vote_db import _write_lock, db, init_db, progress_of, rollback, seed
+from vote_serving import next_pair
 
 
-def _qid(name):
-    """SQL 식별자 인용."""
-    return '"%s"' % str(name).replace('"', '""')
-
-
-def blocking_uniques(conn):
-    """votes 에서 (voter,pair_id) 를 '전면' UNIQUE 로 묶는 인덱스 목록.
-
-    이런 인덱스가 남아 있으면 정정(같은 voter·pair 의 두 번째 행)이
-    IntegrityError 로 죽는다. origin 이
-      'c' → CREATE INDEX 로 만든 것, DROP INDEX 로 없앨 수 있다
-      'u' → CREATE TABLE 의 UNIQUE(...) 제약, DROP 이 안 된다(테이블 재작성 필요)
-    """
-    out = []
-    for r in conn.execute("PRAGMA index_list(votes)"):
-        keys = r.keys()
-        if not r["unique"]:
-            continue
-        if "partial" in keys and r["partial"]:
-            continue          # 부분 UNIQUE(= 우리가 만든 active 전용)는 그대로 둔다
-        try:
-            cols = [x[0] for x in conn.execute(
-                "SELECT name FROM pragma_index_info(?)", (r["name"],))]
-        except sqlite3.Error:
-            cols = [x["name"] for x in conn.execute(
-                "PRAGMA index_info(%s)" % _qid(r["name"]))]
-        if set(cols) == {"voter", "pair_id"}:
-            origin = r["origin"] if "origin" in keys else "c"
-            out.append((r["name"], origin))
-    return out
-
-
-def rebuild_votes(conn, cur):
-    """votes 를 UNIQUE 제약 없는 스키마로 다시 만든다.
-
-    * id 를 그대로 옮기므로 superseded_by/revised_from 체인이 깨지지 않는다.
-    * 정본에 없는 컬럼(누가 나중에 추가했을 수 있다)도 원래 선언 그대로 옮긴다.
-      모르는 컬럼을 조용히 날리지 않기 위함이다.
-    """
-    info = [(r["name"], r["type"] or "") for r in
-            conn.execute("PRAGMA table_info(votes)")]
-    have = {n for n, _ in info}
-    decls, keep = [], []
-    for name, decl in VOTE_COLUMNS:
-        decls.append("%s %s" % (_qid(name), decl))
-        if name in have:
-            keep.append(name)
-    for name, typ in info:                       # 정본에 없는 여분 컬럼 보존
-        if name not in VOTE_COLNAMES:
-            decls.append(("%s %s" % (_qid(name), typ)).strip())
-            keep.append(name)
-    cols_sql = ",".join(_qid(c) for c in keep)
-
-    cur.execute("DROP TABLE IF EXISTS votes_mig_new")
-    cur.execute("CREATE TABLE votes_mig_new(%s)" % ", ".join(decls))
-    cur.execute("INSERT INTO votes_mig_new(%s) SELECT %s FROM votes"
-                % (cols_sql, cols_sql))
-    cur.execute("DROP TABLE votes")
-    cur.execute("ALTER TABLE votes_mig_new RENAME TO votes")
-
-
-def db():
-    """스레드별 커넥션."""
-    conn = getattr(_local, "conn", None)
-    if conn is None:
-        conn = sqlite3.connect(DB_PATH, timeout=15.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=10000")
-        conn.execute("PRAGMA foreign_keys=ON")
-        _local.conn = conn
-    return conn
-
-
-def rollback(conn):
-    """열린 트랜잭션을 반드시 되돌린다. 안 그러면 그 스레드 커넥션이
-    쓰기 락을 붙든 채 남아 이후 모든 쓰기가 'database is locked' 로 죽는다."""
-    try:
-        conn.rollback()
-    except sqlite3.Error:
-        pass
-
-
-def init_db():
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    conn = db()
-    conn.executescript(SCHEMA)
-    conn.commit()
-    migrate_db()
-
-
-def migrate_db():
-    """구 배포본 DB(감사 컬럼 없음) → 현재 스키마로 무손실 마이그레이션.
-
-    * `PRAGMA table_info` 로 확인 후 없는 컬럼만 `ALTER TABLE ADD COLUMN`
-    * 기존 행: active=1, created_at_iso 는 기존 ts(KST) 로 백필
-    * 전면 UNIQUE(voter,pair_id) 인덱스는 제거하고 active 표에만 부분 UNIQUE.
-      그 UNIQUE 가 CREATE TABLE 의 제약이면 DROP 이 안 되므로 테이블을 다시 만든다
-      (구 배포본이 어느 형태였든 정정이 되게 하려면 둘 다 처리해야 한다)
-    * pairs.votes 를 active 표 기준으로 재집계(정정 때문에 부풀지 않게)
-    """
-    conn = db()
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(votes)")}
-    added = []
-    dropped = []
-    rebuilt = False
-
-    with _write_lock:
-        cur = conn.cursor()
-        try:
-            cur.execute("BEGIN IMMEDIATE")
-            for name, decl in NEW_COLUMNS:
-                if name not in cols:
-                    cur.execute("ALTER TABLE votes ADD COLUMN %s %s"
-                                % (name, decl))
-                    added.append(name)
-                    cols.add(name)
-
-            # 기존 행 백필 (ALTER 의 DEFAULT 가 안 먹은 경우도 방어)
-            cur.execute("UPDATE votes SET active=1 WHERE active IS NULL")
-            cur.execute(
-                "UPDATE votes SET created_at_iso="
-                " strftime('%Y-%m-%dT%H:%M:%S', ts, 'unixepoch', '+9 hours')"
-                " || '+09:00'"
-                " WHERE created_at_iso IS NULL AND ts IS NOT NULL")
-            cur.execute("UPDATE votes SET created_at_iso=''"
-                        " WHERE created_at_iso IS NULL")
-
-            # 구 배포본의 전면 UNIQUE(voter,pair_id) 는 정정 행을 막는다 → 교체
-            for iname, origin in blocking_uniques(conn):
-                if origin == "c":
-                    cur.execute("DROP INDEX %s" % _qid(iname))
-                    dropped.append(iname)
-                else:
-                    # CREATE TABLE 의 UNIQUE 제약 → 테이블을 다시 만들어야 뗀다
-                    rebuild_votes(conn, cur)
-                    dropped.append(iname)
-                    rebuilt = True
-                    break          # 테이블째 새로 만들었으니 나머지도 같이 사라졌다
-            for sql in VOTE_INDEXES:
-                cur.execute(sql)
-
-            # pairs.votes = active 표 개수
-            cur.execute(
-                "UPDATE pairs SET votes=(SELECT COUNT(*) FROM votes v"
-                " WHERE v.pair_id=pairs.id AND v.active=1)"
-                " WHERE votes<>(SELECT COUNT(*) FROM votes v"
-                " WHERE v.pair_id=pairs.id AND v.active=1)")
-            fixed = cur.rowcount
-            conn.commit()
-        except Exception:                                 # noqa: BLE001
-            rollback(conn)
-            raise
-
-    # 정정을 막는 UNIQUE 가 정말 사라졌는지 확인 — 남아 있으면 조용히 죽는 대신 알린다
-    left = blocking_uniques(conn)
-    if left:
-        log("경고: 정정을 막는 UNIQUE 인덱스가 남아 있습니다 %s"
-            " — 이 상태로는 '이전 답 수정' 이 500 으로 실패합니다" % [n for n, _ in left])
-
-    if added or dropped or fixed > 0:
-        log("migrate: +컬럼 %s / 구 UNIQUE %s / pairs.votes 보정 %d행"
-            % (",".join(added) or "-",
-               (("테이블 재작성으로 제거 " if rebuilt else "인덱스 제거 ")
-                + ",".join(dropped)) if dropped else "없음",
-               max(fixed, 0)))
-
-
-def seed():
-    """vote_pool.json 으로 items/pairs 시드. 재시드 안전(기존 행·투표 보존)."""
-    conn = db()
-    if not os.path.exists(POOL_PATH):
-        log("pool 파일 없음, 시드 생략: %s" % POOL_PATH)
-        return
-    try:
-        with open(POOL_PATH, "r", encoding="utf-8") as f:
-            pool = json.load(f)
-    except Exception as exc:
-        log("pool 파싱 실패(시드 생략): %s" % exc)
-        return
-
-    items = pool.get("items") or []
-    if not items:
-        log("pool 에 items 없음, 시드 생략")
-        return
-
-    rows = []
-    by_step = {}
-    for it in items:
-        eid = str(it.get("eid") or "").strip()
-        if not eid:
-            continue
-        try:
-            step = int(it.get("step"))
-        except (TypeError, ValueError):
-            continue
-        clip = str(it.get("clip") or "").strip()
-        rows.append((eid, step, str(it.get("run") or ""),
-                     int(it.get("ep") or 0), str(it.get("outcome") or ""),
-                     clip, int(it.get("n_frames") or 0),
-                     str(it.get("instruction") or "")))
-        by_step.setdefault(step, []).append(eid)
-
-    with _write_lock:
-        cur = conn.cursor()
-        try:
-            cur.execute("BEGIN")
-            cur.executemany(
-                "INSERT OR IGNORE INTO items"
-                "(eid,step,run,ep,outcome,clip,n_frames,instruction)"
-                " VALUES(?,?,?,?,?,?,?,?)", rows)
-            new_items = cur.rowcount
-
-            pair_rows = []
-            for step, eids in by_step.items():
-                for a, b in combinations(sorted(set(eids)), 2):
-                    if a > b:
-                        a, b = b, a
-                    pair_rows.append((step, a, b))
-            cur.executemany(
-                "INSERT OR IGNORE INTO pairs(step,a,b,votes) VALUES(?,?,?,0)",
-                pair_rows)
-            new_pairs = cur.rowcount
-            conn.commit()
-        except Exception:                                 # noqa: BLE001
-            rollback(conn)
-            raise
-
-    n_items = conn.execute("SELECT COUNT(*) c FROM items").fetchone()["c"]
-    n_pairs = conn.execute("SELECT COUNT(*) c FROM pairs").fetchone()["c"]
-    n_votes = conn.execute("SELECT COUNT(*) c FROM votes").fetchone()["c"]
-    log("seed: items %d(+%d) pairs %d(+%d) votes %d"
-        % (n_items, max(new_items, 0), n_pairs, max(new_pairs, 0), n_votes))
-
-
-def progress_of(voter):
-    conn = db()
-    my = conn.execute("SELECT COUNT(*) c FROM votes WHERE voter=? AND active=1",
-                      (voter,)).fetchone()["c"]
-    rev = conn.execute("SELECT COUNT(*) c FROM votes"
-                       " WHERE voter=? AND superseded_by IS NOT NULL",
-                       (voter,)).fetchone()["c"]
-    if ACTIVE_STEPS:
-        ph = ",".join("?" * len(ACTIVE_STEPS))
-        tot = conn.execute("SELECT COUNT(*) c FROM pairs WHERE step IN (%s)" % ph,
-                           ACTIVE_STEPS).fetchone()["c"]
-        cov = conn.execute("SELECT COUNT(*) c FROM pairs WHERE votes>0"
-                           " AND step IN (%s)" % ph, ACTIVE_STEPS).fetchone()["c"]
-    else:
-        tot = conn.execute("SELECT COUNT(*) c FROM pairs").fetchone()["c"]
-        cov = conn.execute("SELECT COUNT(*) c FROM pairs WHERE votes>0").fetchone()["c"]
-    return {"my_votes": my, "my_revisions": rev,
-            "total_pairs": tot, "covered": cov}
-
-
-# --------------------------------------------------------------------------
-# HTTP
-# --------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     server_version = "rollout_vote"
     sys_version = ""
@@ -512,6 +146,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._stats()
             if path.startswith("/clip/"):
                 return self._clip(path[len("/clip/"):])
+            if path.startswith("/static/"):
+                return self._static(path[len("/static/"):])
             if path == "/favicon.ico":
                 return self._send(204, b"", "image/x-icon")
             return self._send(404, "not found")
@@ -545,6 +181,24 @@ class Handler(BaseHTTPRequestHandler):
         extra["Cache-Control"] = "no-cache"
         self._send(200, data, "text/html; charset=utf-8", extra)
 
+    def _static(self, name):
+        """/static/ 아래 CSS·JS 파일. 클립과 같은 방식으로 경로 탈출을 막는다."""
+        name = name.split("?")[0]
+        if "/" in name or "\\" in name or ".." in name or not STATIC_RE.match(name):
+            return self._send(404, "not found")
+        path = os.path.abspath(os.path.join(STATIC_DIR, name))
+        if os.path.dirname(path) != os.path.abspath(STATIC_DIR) \
+                or not os.path.isfile(path):
+            return self._send(404, "not found")
+        ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        if ctype.startswith("text/") or ctype in ("application/javascript",
+                                                  "text/javascript"):
+            ctype += "; charset=utf-8"
+        with open(path, "rb") as f:
+            data = f.read()
+        # index.html 과 같은 no-cache — 배포 직후에도 낡은 JS/CSS 를 물지 않게
+        self._send(200, data, ctype, {"Cache-Control": "no-cache"})
+
     def _api_next(self, q):
         voter, extra = self._voter()
         conn = db()
@@ -556,62 +210,12 @@ class Handler(BaseHTTPRequestHandler):
                 excl.append(int(tok))
         excl = excl[:400]
 
-        sql = ("SELECT p.id,p.step,p.a,p.b FROM pairs p "
-               "WHERE p.id NOT IN (SELECT pair_id FROM votes WHERE voter=?)")
-        args = [voter]
-        if ACTIVE_STEPS:
-            sql += " AND p.step IN (%s)" % ",".join("?" * len(ACTIVE_STEPS))
-            args += ACTIVE_STEPS
-        if excl:
-            sql += " AND p.id NOT IN (%s)" % ",".join("?" * len(excl))
-            args += excl
-        # second opinion: 일정 확률로 1표짜리 쌍을 앞세운다 (없으면 자연히 기존 순서)
-        if uuid.uuid4().int % 1000 < SECOND_OPINION_P * 1000:
-            sql += " ORDER BY (p.votes = 1) DESC, p.votes ASC, RANDOM() LIMIT %d" % CAND_LIMIT
-        else:
-            sql += " ORDER BY p.votes ASC, RANDOM() LIMIT %d" % CAND_LIMIT
-
-        cands = conn.execute(sql, args).fetchall()
-        if not cands:
+        data = next_pair(conn, voter, excl)
+        if data is None:
             return self._json({"done": True, "progress": progress_of(voter)},
                               200, extra)
-
-        # 클립 파일이 실제로 있는 쌍을 우선(클립 생성이 진행 중일 수 있음)
-        chosen, chosen_items = None, None
-        fallback, fallback_items = None, None
-        for row in cands:
-            its = conn.execute(
-                "SELECT eid,clip,instruction,step FROM items WHERE eid IN (?,?)",
-                (row["a"], row["b"])).fetchall()
-            if len(its) != 2:
-                continue
-            m = {r["eid"]: r for r in its}
-            if fallback is None:
-                fallback, fallback_items = row, m
-            ok = all(r["clip"] and os.path.exists(
-                os.path.join(CLIPS_DIR, r["clip"])) for r in its)
-            if ok:
-                chosen, chosen_items = row, m
-                break
-        if chosen is None:
-            chosen, chosen_items = fallback, fallback_items
-        if chosen is None:
-            return self._json({"done": True, "progress": progress_of(voter)},
-                              200, extra)
-
-        a, b = chosen["a"], chosen["b"]
-        # 좌/우 위치 편향 방지: 매번 무작위
-        if uuid.uuid4().int & 1:
-            a, b = b, a
-        ia, ib = chosen_items[a], chosen_items[b]
-        return self._json({
-            "pair_id": chosen["id"],
-            "step": chosen["step"],
-            "instruction": ia["instruction"] or ib["instruction"] or "",
-            "left":  {"eid": ia["eid"], "clip": ia["clip"]},
-            "right": {"eid": ib["eid"], "clip": ib["clip"]},
-            "progress": progress_of(voter),
-        }, 200, extra)
+        data["progress"] = progress_of(voter)
+        return self._json(data, 200, extra)
 
     def _api_vote(self):
         voter, extra = self._voter()

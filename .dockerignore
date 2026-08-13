@@ -1,4 +1,4 @@
-# 빌드 컨텍스트에서 제외 — 앱은 app.py / index.html 만 필요하다
+# 빌드 컨텍스트에서 제외 — 앱은 *.py / index.html / static/ 만 필요하다
 data/
 clips/
 *.db

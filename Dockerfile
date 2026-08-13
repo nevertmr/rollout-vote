@@ -12,7 +12,8 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # 앱 파일만 COPY — 영상(클립)은 이미지에 굽지 않고 bind mount 로 붙인다
-COPY app.py index.html /app/
+COPY app.py vote_config.py vote_db.py vote_serving.py index.html /app/
+COPY static /app/static
 
 EXPOSE 8080
 
