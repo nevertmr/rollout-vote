@@ -55,6 +55,14 @@ COOKIE_MAX_AGE = 31536000  # 1년
 CAND_LIMIT = 60            # 클립 존재 확인용 후보 개수
 HISTORY_MAX = 200          # /api/history limit 상한
 
+# 집중 수집 대상 스텝. 빈 문자열이면 전체 스텝 서빙(기존 동작).
+ACTIVE_STEPS = [int(s) for s in
+                os.environ.get("VOTE_ACTIVE_STEPS", "3,10").split(",")
+                if s.strip().isdigit()]
+# 이 확률로 "이미 1표 받은 쌍"을 우선 배정 — 같은 쌍에 서로 다른 투표자의
+# 표를 겹치게 만들어 사람 간 일치율(inter-rater)을 잴 수 있게 한다.
+SECOND_OPINION_P = float(os.environ.get("VOTE_SECOND_OPINION_P", "0.25"))
+
 KST = datetime.timezone(datetime.timedelta(hours=9))
 
 # 브라우저가 연결을 끊는 것은 오류가 아니다(영상 로딩 중단·탭 닫힘 등)
@@ -397,8 +405,15 @@ def progress_of(voter):
     rev = conn.execute("SELECT COUNT(*) c FROM votes"
                        " WHERE voter=? AND superseded_by IS NOT NULL",
                        (voter,)).fetchone()["c"]
-    tot = conn.execute("SELECT COUNT(*) c FROM pairs").fetchone()["c"]
-    cov = conn.execute("SELECT COUNT(*) c FROM pairs WHERE votes>0").fetchone()["c"]
+    if ACTIVE_STEPS:
+        ph = ",".join("?" * len(ACTIVE_STEPS))
+        tot = conn.execute("SELECT COUNT(*) c FROM pairs WHERE step IN (%s)" % ph,
+                           ACTIVE_STEPS).fetchone()["c"]
+        cov = conn.execute("SELECT COUNT(*) c FROM pairs WHERE votes>0"
+                           " AND step IN (%s)" % ph, ACTIVE_STEPS).fetchone()["c"]
+    else:
+        tot = conn.execute("SELECT COUNT(*) c FROM pairs").fetchone()["c"]
+        cov = conn.execute("SELECT COUNT(*) c FROM pairs WHERE votes>0").fetchone()["c"]
     return {"my_votes": my, "my_revisions": rev,
             "total_pairs": tot, "covered": cov}
 
@@ -544,10 +559,17 @@ class Handler(BaseHTTPRequestHandler):
         sql = ("SELECT p.id,p.step,p.a,p.b FROM pairs p "
                "WHERE p.id NOT IN (SELECT pair_id FROM votes WHERE voter=?)")
         args = [voter]
+        if ACTIVE_STEPS:
+            sql += " AND p.step IN (%s)" % ",".join("?" * len(ACTIVE_STEPS))
+            args += ACTIVE_STEPS
         if excl:
             sql += " AND p.id NOT IN (%s)" % ",".join("?" * len(excl))
             args += excl
-        sql += " ORDER BY p.votes ASC, RANDOM() LIMIT %d" % CAND_LIMIT
+        # second opinion: 일정 확률로 1표짜리 쌍을 앞세운다 (없으면 자연히 기존 순서)
+        if uuid.uuid4().int % 1000 < SECOND_OPINION_P * 1000:
+            sql += " ORDER BY (p.votes = 1) DESC, p.votes ASC, RANDOM() LIMIT %d" % CAND_LIMIT
+        else:
+            sql += " ORDER BY p.votes ASC, RANDOM() LIMIT %d" % CAND_LIMIT
 
         cands = conn.execute(sql, args).fetchall()
         if not cands:
